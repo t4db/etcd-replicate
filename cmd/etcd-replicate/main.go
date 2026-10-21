@@ -26,6 +26,9 @@ import (
 
 const envPrefix = "ETCD_REPLICATE_"
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 const usage = `Usage: etcd-replicate [flags]
 
 Continuously replicate the source into the target, applying each source
@@ -148,11 +151,16 @@ func run(args []string) error {
 	reconcileInterval := fs.Duration("lease-reconcile-interval", 5*time.Second, "how often target leases are kept alive and leases gone from the source are revoked")
 	metricsAddr := fs.String("metrics-addr", "0.0.0.0:9091", "HTTP address for /metrics and /healthz; empty disables")
 	logLevel := fs.String("log-level", "info", "log level (debug/info/warn/error)")
+	printVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
+	}
+	if *printVersion {
+		fmt.Println(version)
+		return nil
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %v", fs.Args())
@@ -197,7 +205,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	log.Info("replicate: starting", "source", source.endpoints, "target", target.endpoints)
+	log.Info("replicate: starting", "version", version, "source", source.endpoints, "target", target.endpoints)
 	err = r.Run(ctx)
 	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		log.Info("replicate: stopped", "revision", r.Applied())

@@ -29,6 +29,16 @@ or a progress notification covers it, never on a watch response boundary.
 
 ## Install
 
+Each [release](https://github.com/t4db/etcd-replicate/releases) has binaries
+for Linux, macOS and Windows on amd64 and arm64, with signed checksums, and a
+signed multi-arch image:
+
+```bash
+docker run ghcr.io/t4db/etcd-replicate:<version> --source-endpoints ... --target-endpoints ...
+```
+
+Or build it with Go:
+
 ```bash
 go install github.com/t4db/etcd-replicate/cmd/etcd-replicate@latest
 ```
@@ -102,6 +112,7 @@ the flag name in upper case with `-` replaced by `_`, for example
 | `--lease-reconcile-interval` | `5s` | How often target leases are kept alive and leases gone from the source are revoked |
 | `--metrics-addr` | `0.0.0.0:9091` | HTTP address for `/metrics` and `/healthz`; empty disables |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
+| `--version` | — | Print the version and exit |
 
 ### Leases
 
