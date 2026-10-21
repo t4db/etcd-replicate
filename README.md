@@ -118,8 +118,8 @@ the flag name in upper case with `-` replaced by `_`, for example
 | `--target-user` | — | Username for the target |
 | `--target-password` | — | Password for the target |
 | `--state-prefix` | `/__etcd_replicate/` | Target key prefix for replication state; source keys under it are not replicated |
-| `--lease-ttl-margin` | `10m` | Added to lease TTLs on the target so it never expires a lease before the source; must exceed the longest replicator downtime |
-| `--lease-reconcile-interval` | `5s` | How often target leases are kept alive and leases gone from the source are revoked |
+| `--lease-ttl-margin` | `10m` | Added to lease TTLs on the target so it never expires a lease before the source; must exceed the longest replicator downtime by a tenth of itself, at most a minute (see [Leases](#leases)) |
+| `--lease-reconcile-interval` | `5s` | How often target leases due for renewal are kept alive and leases gone from the source are revoked |
 | `--metrics-addr` | `0.0.0.0:9091` | HTTP address for `/metrics` and `/healthz`; empty disables |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--version` | — | Print the version and exit |
@@ -128,15 +128,18 @@ the flag name in upper case with `-` replaced by `_`, for example
 
 Leases are created on the target with the same IDs. Their TTL there is the
 source's TTL plus `--lease-ttl-margin`. The replicator keeps them alive while
-they exist on the source, and revokes them once the source no longer has them
+they exist on the source, renewing each one once a tenth of the margin, at
+most a minute, has passed since its last renewal, and revokes them once the
+source no longer has them
 and their keys are gone. Keys attached to a lease are deleted on the target
 when the source deletes them, at the same revision. None of this consumes
 target revisions.
 
 The target must never expire a lease before the source does: that would
 create a revision the source does not have. If the replicator is down longer
-than the margin, target leases can expire and replication stops. Set the
-margin above the longest downtime you want to tolerate.
+than the margin minus the renewal interval (9 minutes with the default 10m
+margin), target leases can expire and replication stops. Set the margin above
+the longest downtime you want to tolerate, plus a tenth.
 
 ### Transaction limits
 

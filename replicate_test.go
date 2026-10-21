@@ -72,16 +72,22 @@ func quietLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func newReplicator(t *testing.T, source, target *clientv3.Client) *Replicator {
+// newReplicator returns a replicator with test timings; opts adjust its
+// config.
+func newReplicator(t *testing.T, source, target *clientv3.Client, opts ...func(*Config)) *Replicator {
 	t.Helper()
-	r, err := New(Config{
+	cfg := Config{
 		Source:            source,
 		Target:            target,
 		LeaseTTLMargin:    time.Minute,
 		ReconcileInterval: 100 * time.Millisecond,
 		RetryInterval:     50 * time.Millisecond,
 		Log:               quietLog(),
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	r, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
