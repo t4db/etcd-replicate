@@ -239,7 +239,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.release.outputs.tag_name }}
         run: |
-          gh release upload "$TAG_NAME" \
+          # This job has no checkout, so name the repository explicitly.
+          gh release upload "$TAG_NAME" --repo "$GITHUB_REPOSITORY" \
             ./dist/checksums.txt \
             ./dist/checksums.txt.sig \
             ./dist/checksums.txt.pem \
