@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  precheck:
+    name: Verify CI green on release SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Wait for CI success on ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            run=$(gh run list \
+              --repo "$REPO" \
+              --workflow ci.yml \
+              --commit "$SHA" \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0]')
+            if [[ -z "$run" || "$run" == "null" ]]; then
+              echo "No CI run for $SHA yet, waiting..."
+              sleep 30
+              continue
+            fi
+            status=$(echo "$run" | jq -r .status)
+            conclusion=$(echo "$run" | jq -r .conclusion)
+            if [[ "$status" == "completed" ]]; then
+              if [[ "$conclusion" == "success" ]]; then
+                echo "CI success on $SHA"
+                exit 0
+              fi
+              echo "CI conclusion=$conclusion on $SHA — refuse release" >&2
+              exit 1
+            fi
+            echo "CI status=$status on $SHA, waiting..."
+            sleep 30
+          done
+          echo "Timed out waiting for CI on $SHA" >&2
+          exit 1
+
+  release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    needs: precheck
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag_name }}
+      image_tag: ${{ steps.image_tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          echo "tag_name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.tag.outputs.tag_name }}
+        run: |
+          flags=(--draft --title "$TAG_NAME" --generate-notes)
+          if [[ "$TAG_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists"
+          else
+            gh release create "$TAG_NAME" "${flags[@]}"
+          fi
+
+      - name: Prepare image tag
+        id: image_tag
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag_name }}
+        run: |
+          image_tag="${TAG_NAME#v}"
+          echo "image_tag=${image_tag//+/-}" >> "$GITHUB_OUTPUT"
+
+  build-image:
+    name: Build tagged image
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Build and push tagged image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository }}:${{ needs.release.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          build-args: |
+            VERSION=${{ needs.release.outputs.tag_name }}
+
+      - name: Sign image (cosign keyless)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  build-binaries:
+    name: Build binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+    env:
+      BIN: etcd-replicate-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        run: |
+          mkdir -p dist
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${TAG_NAME}" \
+            -o "dist/${BIN}" \
+            ./cmd/etcd-replicate
+
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/${{ env.BIN }}
+
+      - name: Upload binary to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        run: |
+          gh release upload "$TAG_NAME" "./dist/${BIN}" --clobber
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BIN }}
+          path: dist/${{ env.BIN }}
+          if-no-files-found: error
+
+  checksums:
+    name: Publish checksums
+    runs-on: ubuntu-latest
+    needs:
+      - release
+      - build-binaries
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: etcd-replicate-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum etcd-replicate-* > checksums.txt
+
+      - name: Sign checksums (cosign keyless)
+        run: |
+          cd dist
+          cosign sign-blob --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem \
+            checksums.txt
+
+      - name: Upload checksums and signature to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+        run: |
+          gh release upload "$TAG_NAME" \
+            ./dist/checksums.txt \
+            ./dist/checksums.txt.sig \
+            ./dist/checksums.txt.pem \
+            --clobber
