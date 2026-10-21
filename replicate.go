@@ -53,12 +53,15 @@ type Config struct {
 
 	// LeaseTTLMargin is added to a lease's TTL on the target. The target must
 	// never expire a lease before the source does, since that would create a
-	// revision the source does not have; the margin must exceed the longest
-	// tolerated replication lag or replicator downtime. Default 10m.
+	// revision the source does not have. A target lease is renewed once a
+	// tenth of the margin, at most a minute, has passed since it was last
+	// renewed, so the margin must exceed the longest tolerated replication
+	// lag or replicator downtime by that much. Default 10m.
 	LeaseTTLMargin time.Duration
 
-	// ReconcileInterval is how often target leases are kept alive and leases
-	// gone from the source are revoked on the target. Default 5s.
+	// ReconcileInterval is how often target leases due for renewal are kept
+	// alive and leases gone from the source are revoked on the target.
+	// Default 5s.
 	ReconcileInterval time.Duration
 
 	// ProgressDelay is how long the last received revision may wait for
@@ -95,8 +98,8 @@ type Replicator struct {
 	applied      atomic.Int64 // source revision the target is at
 	cursorExists bool
 
-	leases    map[clientv3.LeaseID]struct{} // leases mirrored on the target
-	grantedTT map[clientv3.LeaseID]int64    // source granted TTL, seconds
+	leases    map[clientv3.LeaseID]time.Time // leases mirrored on the target, by when they were last granted or renewed there
+	grantedTT map[clientv3.LeaseID]int64     // source granted TTL, seconds
 }
 
 // New validates cfg and returns a Replicator.
@@ -385,12 +388,13 @@ func (r *Replicator) grantTarget(ctx context.Context, id clientv3.LeaseID) error
 		return err
 	}
 	// clientv3 cannot choose the lease ID; the raw RPC can.
+	granted := time.Now()
 	_, err = etcdserverpb.NewLeaseClient(r.cfg.Target.ActiveConnection()).LeaseGrant(ctx,
 		&etcdserverpb.LeaseGrantRequest{ID: int64(id), TTL: ttl + int64(r.cfg.LeaseTTLMargin/time.Second)})
 	if err != nil && !leaseExists(err) {
 		return fmt.Errorf("grant lease %x on target: %w", id, err)
 	}
-	r.leases[id] = struct{}{}
+	r.leases[id] = granted
 	r.updateLeaseMetric()
 	return nil
 }
@@ -420,13 +424,26 @@ func (r *Replicator) loadTargetLeases(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list target leases: %w", err)
 	}
-	r.leases = make(map[clientv3.LeaseID]struct{}, len(resp.Leases))
+	r.leases = make(map[clientv3.LeaseID]time.Time, len(resp.Leases))
 	r.grantedTT = make(map[clientv3.LeaseID]int64)
 	for _, l := range resp.Leases {
-		r.leases[l.ID] = struct{}{}
+		// When these were last renewed is unknown, so the first reconcile
+		// renews them.
+		r.leases[l.ID] = time.Time{}
 	}
 	r.updateLeaseMetric()
 	return nil
+}
+
+// renewInterval is how long a target lease goes between renewals. A target
+// lease renewed at time k lives until k + source TTL + margin, while the
+// source's lives at most a source TTL from now, so the target outlives the
+// source as long as it is renewed within the margin. Renewing every tenth of
+// it, at most every minute, leaves most of the margin for replicator
+// downtime, without a keepalive per lease every reconcile: on a target that
+// persists each keepalive, such as T4, that would hold up replication.
+func (r *Replicator) renewInterval() time.Duration {
+	return min(r.cfg.LeaseTTLMargin/10, time.Minute)
 }
 
 // reconcileLeases keeps target leases alive while the source has them,
@@ -442,13 +459,18 @@ func (r *Replicator) reconcileLeases(ctx context.Context) error {
 	onSource := make(map[clientv3.LeaseID]struct{}, len(src.Leases))
 	for _, l := range src.Leases {
 		onSource[l.ID] = struct{}{}
-		if _, ok := r.leases[l.ID]; ok {
+		if renewed, ok := r.leases[l.ID]; ok {
+			if time.Since(renewed) < r.renewInterval() {
+				continue
+			}
+			now := time.Now()
 			if _, err := r.cfg.Target.KeepAliveOnce(ctx, l.ID); err != nil {
 				if leaseNotFound(err) {
 					return halt("lease %x expired on the target while the source still has it; the target has diverged (raise --lease-ttl-margin)", l.ID)
 				}
 				return fmt.Errorf("keep lease %x alive on target: %w", l.ID, err)
 			}
+			r.leases[l.ID] = now
 			continue
 		}
 		if err := r.grantTarget(ctx, l.ID); err != nil {
