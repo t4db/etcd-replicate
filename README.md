@@ -1,15 +1,25 @@
 # etcd-replicate
 
-`etcd-replicate` continuously copies an etcd v3 keyspace into another etcd v3
-endpoint so that both are at **identical revisions**: after source revision R
-is applied, the target is at revision R with the same keys, values, create and
-mod revisions, versions and leases.
+`etcd-replicate` replicates an etcd v3 keyspace into another etcd v3 endpoint
+in real time: etcd to etcd, [T4](https://github.com/t4db/t4) to etcd, or etcd
+to T4. It follows the source's watch stream and applies each revision to the
+target as it happens, so the target is at the **same revision** with the same
+keys, values, create and mod revisions, versions and leases.
 
 Kubernetes uses revisions as `resourceVersion`s, for watches and for optimistic
-concurrency. Because the revisions match, kube-apiserver can be switched from
-the source to the target, for example to move to a new etcd cluster or between
-etcd and an etcd-compatible store such as [T4](https://github.com/t4db/t4),
-without clients relisting, losing watches or hitting a wave of conflicts.
+concurrency. Because the revisions match, kube-apiserver can be pointed at the
+target without clients relisting, losing watches or hitting a wave of
+conflicts. That makes the target useful as:
+
+- **A live standby.** Keep a second copy of a cluster's datastore, for example
+  a T4 database replicated into a plain etcd cluster, and fail over to it if
+  the source is lost.
+- **A migration path.** Move to a new etcd cluster, or between etcd and T4,
+  with a short write pause instead of a backup and restore.
+
+A replica is not a point-in-time backup: deletes and bad writes reach it within
+moments. Keep snapshots for that. The standby also has to start together with
+the source (see [Requirements](#requirements)).
 
 ## How it works
 
@@ -171,6 +181,10 @@ on the target prevents this.
 4. Stop the replicator.
 5. Give the kube-apiserver credentials access to the target.
 6. Point kube-apiserver's `--etcd-servers` at the target and start it.
+
+If the source is lost instead, skip steps 2 and 3. The target holds every
+revision up to `etcd_replicate_applied_revision`. Writes the source
+acknowledged after that, at most the lag at the time, are lost.
 
 Watches resume from the resourceVersions clients already have. The
 `/__etcd_replicate/` keys stay on the target; kube-apiserver does not read
