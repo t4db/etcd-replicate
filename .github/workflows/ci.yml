@@ -20,6 +20,22 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
+  # Replication between T4 and etcd, in a module of its own so that the
+  # replicator's module does not depend on T4.
+  t4:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/t4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tests/t4/go.mod
+          cache-dependency-path: tests/t4/go.sum
+      - run: go vet ./...
+      - run: go test -race ./...
+
   image:
     runs-on: ubuntu-latest
     steps:
